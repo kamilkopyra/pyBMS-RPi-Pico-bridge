@@ -125,6 +125,25 @@ void spi_write(uint8_t *tx_data, size_t tx_len)
     );
 }
 
+static void spi_write_slow(const uint8_t *data, uint16_t len, uint32_t gap_us)
+{
+    for (uint16_t i = 0; i < len; i++) 
+    {
+        spi_write_blocking(spi0, &data[i], 1);
+        busy_wait_us(gap_us);
+    }
+}
+
+static void spi_read_slow(uint8_t *rx, uint16_t len, uint32_t gap_us)
+{
+    uint8_t dummy = 0x00;
+    for (uint16_t i = 0; i < len; i++) 
+    {
+        spi_write_read_blocking(spi0, &dummy, &rx[i], 1);
+        busy_wait_us(gap_us);
+    }
+}
+
 
 void add_command_to_buffer(uint8_t *frame, uint16_t len)
 {
@@ -318,7 +337,7 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
         case 0x01:   // write
         {
             cs_low();
-            spi_write_blocking(spi0,tx_data,tx_len);
+            spi_write_slow(tx_data,tx_len, 250);
             cs_high();
             return 0;
         }
@@ -326,18 +345,26 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
         case 0x02: // read
             
             cs_low();
-            if (tx_len) spi_write_blocking(spi0, tx_data,tx_len);
+            if (tx_len) {
+                for(int i = 0; i < tx_len; i++)
+                {
+                    spi_write_slow(&tx_data[i], 1, 250);
+                    busy_wait_us(70);
+                }
+            }
             //cs_high();
 
             if (rx_len) 
             {
                 //cs_low();
                 memset(tx_dummy, 0x00, rx_len);
-                spi_write_read_blocking(spi0, tx_dummy, rx_tmp, rx_len);
+                spi_read_slow(&cmd_buf[len], rx_len, 50);
                 cs_high();
                 memcpy(&cmd_buf[len], rx_tmp, rx_len);
+                return rx_len;
             }
 
+            cs_high();
             return rx_len;
         
         case 0x03:   //poll
@@ -362,7 +389,7 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
                 busy_wait_us(((uint16_t)tx_data[0] << 8) | tx_data[1]);
             return 0;
 
-        case 0x0E:
+        case 0x0E:   // set SPI frequency
             if (tx_len >= 2)
             {
                 uint32_t freq_khz =
@@ -385,6 +412,36 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
 
 
     
+void send_RDSTATC()
+{
+    uint8_t cmd[] =
+    {
+        0x00,
+        0x2D,
+        0xD2,
+        0xA2
+    };
+
+    uint8_t rx[8];
+    uint8_t dummy[8] = {0};
+
+    cs_low();
+
+    spi_write_blocking(
+        spi0,
+        cmd,
+        4
+    );
+
+    spi_write_read_blocking(
+        spi0,
+        dummy,
+        rx,
+        8
+    );
+
+    cs_high();
+}
 
 
 
@@ -405,6 +462,12 @@ void setup()
  
     spi_init(spi0, SPI_SPEED);      
     spi_set_format(spi0, 8, SPI_CPOL, SPI_CPHA, SPI_MSB_FIRST);
+
+    for (int i = 0 ; i < 5 ; i++)
+    {
+        busy_wait_ms(1000);
+        send_RDSTATC();
+    }
 
 
 }
