@@ -1,0 +1,408 @@
+"""
+demo_pico.py
+
+Pelna logika pomiaru + kalibracji + balansowania dla ADBMS6832,
+przez wlasny mostek Pico (USB_TO_SPI_BYTE), oparta na strukturze
+oryginalnego demo.py od ADI (Discharge_Algo_Demo), ale:
+
+  - uzywa ADBMS6832 zamiast ADBMS6830
+  - uzywa USB_TO_SPI_BYTE (Pico) zamiast SDP-K1
+  - minimalny webowy podglad (tabela napiec, auto-refresh), bez
+    przyciskow/wykresow z oryginalnego demo
+
+Uruchomienie:
+    python demo_pico.py
+    -> otworzy przegladarke na http://127.0.0.1:5000/index
+"""
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "pybms"))
+
+import webbrowser
+from multiprocessing import Process, Queue
+
+from flask import Flask, jsonify, render_template_string
+from waitress import serve
+
+import serial.tools.list_ports
+from DUTs.BMS import BMS
+from Interfaces.USB_TO_SPI_BYTE import USB_TO_SPI_BYTE
+from DUTs.BMS_Configs.ADBMS6832 import ADBMS6832
+
+
+# --------------------------------------------------------------------------
+# Konfiguracja
+# --------------------------------------------------------------------------
+
+def find_pico():
+    for p in serial.tools.list_ports.comports():
+        if p.vid == 0x2E8A:
+            return p.device
+    raise RuntimeError("Pi Pico not found")
+
+
+board_list = [{'Device': ADBMS6832}]
+
+# Ile fizycznie masz podpietych ogniw - reszta z FILTERED_CELLS/AVERAGED_CELLS
+# bedzie zwracac wartosci bez sensu (open wire / szum), co jest oczekiwane
+# przy niepelnym laczuchu.
+NUM_CELLS_CONNECTED = 12
+
+# Parametry balansowania - jak w oryginalnym demo.
+BALANCE_ACCUR   = 0.005   # V, tolerancja rownowagi miedzy ogniwami
+MIN_BALANCE_VAL = 3.7     # V, ponizej tego nie balansujemy (ryzyko rozladowania)
+CAL_PERIOD      = 15      # s, jak czesto uruchamiac cykl kalibracji IIR
+
+# Tabela IIR - jak w oryginalnym demo (skala narasta z liczba probek od
+# przelaczenia rezystora balansujacego).
+IIR_TABLE = [
+    [0, 0], [1, 0.03125], [2, 0.061523438], [3, 0.09085083],
+    [4, 0.119261742], [5, 0.146784812], [6, 0.173447787],
+    [7, 0.199277543], [8, 0.224299908],
+]
+
+
+# --------------------------------------------------------------------------
+# Listy komend
+# --------------------------------------------------------------------------
+
+init_list = [
+    {'command': '$SPI_SET_FREQUENCY_kHz$', 'arguments': {'Frequency': 2000}},
+    {'command': '$SPI_WAKEUP$',            'arguments': {'Wakeup Time': 400}},
+    {'command': 'WRCFGA',                  'arguments': {'FC': 5}},
+    {'command': 'WRCFGB'},
+    {'command': 'RDCFGA', 'map_key': 'CFG'},
+    {'command': 'RDCFGB', 'map_key': 'CFG'},
+    {'command': 'ADCV',                    'arguments': {'CONT': True}},
+    {'command': '$DELAY_MS$',              'arguments': {'Delay': 5}},
+]
+
+balance_list = [
+    {'command': '$SPI_WAKEUP$', 'arguments': {'Wakeup Time': 10}},
+    {'command': 'WRCFGB'},
+    {'command': 'SNAP'},
+    {'command': 'RDSTATC', 'map_key': 'CT'},
+    {'command': 'UNSNAP'},
+]
+
+meas_list = [
+    {'command': '$SPI_WAKEUP$', 'arguments': {'Wakeup Time': 10}},
+    {'command': 'SNAP'},
+    {'command': 'RDFCA', 'map_key': 'CELLS'},
+    {'command': 'RDFCB', 'map_key': 'CELLS'},
+    {'command': 'RDFCC', 'map_key': 'CELLS'},
+    {'command': 'RDFCD', 'map_key': 'CELLS'},
+    {'command': 'RDFCE', 'map_key': 'CELLS'},
+    {'command': 'RDFCF', 'map_key': 'CELLS'},
+    {'command': 'RDSTATC', 'map_key': 'CT'},
+    {'command': 'UNSNAP'},
+]
+
+redundant_meas_list = [
+    {'command': '$SPI_WAKEUP$', 'arguments': {'Wakeup Time': 10}},
+    {'command': 'MUTE'},
+    {'command': 'SNAP'},
+    {'command': 'RDSTATC', 'map_key': 'MUTE'},
+    {'command': 'UNSNAP'},
+    {'command': '$DELAY_MS$', 'arguments': {'Delay': 16}},
+    {'command': '$SPI_WAKEUP$', 'arguments': {'Wakeup Time': 10}},
+    {'command': 'UNMUTE'},
+    {'command': 'SNAP'},
+    {'command': 'RDACA', 'map_key': 'CELLS'},
+    {'command': 'RDACB', 'map_key': 'CELLS'},
+    {'command': 'RDACC', 'map_key': 'CELLS'},
+    {'command': 'RDACD', 'map_key': 'CELLS'},
+    {'command': 'RDACE', 'map_key': 'CELLS'},
+    {'command': 'RDACF', 'map_key': 'CELLS'},
+    {'command': 'RDSTATC', 'map_key': 'UNMUTE'},
+    {'command': 'UNSNAP'},
+]
+
+
+# --------------------------------------------------------------------------
+# Pomocnicze
+# --------------------------------------------------------------------------
+
+def iir_scale(old_ct, new_ct, need_scale, offset):
+    """Zwraca wspolczynnik skalowania IIR dla biezacej liczby probek
+    od przelaczenia rezystora balansujacego."""
+    if not need_scale:
+        return 1, False, 0
+
+    if new_ct < old_ct:
+        ct = new_ct + 2048 - old_ct + offset
+    else:
+        ct = new_ct - old_ct + offset
+
+    if ct >= len(IIR_TABLE):
+        return 1, False, 0
+    return IIR_TABLE[ct][1], True, offset
+
+
+def make_switch_config(state=False):
+    return {f'DCC{n}': state for n in range(1, 17)}
+
+
+# --------------------------------------------------------------------------
+# Petla pomiarowa (dziala w osobnym procesie)
+# --------------------------------------------------------------------------
+
+def data_collection(queue, dcc_input):
+    """Glowna petla: pomiar + kalibracja IIR + balansowanie.
+    Struktura stanu ('start' -> 'switch_off' -> 'switch_on' -> None)
+    odzwierciedla oryginalne demo ADI."""
+
+    interface = USB_TO_SPI_BYTE(find_pico(), 115200)
+    bms = BMS(interface)
+
+    print("=== INIT ===")
+    init_res = bms.run_generic_command_list(init_list, board_list)
+    print("init PEC:", init_res.get('Total_PEC_Status'))
+
+    # Stan kalibracji
+    cal_state             = None
+    cal_in_progress        = False
+    cal_time               = time.time()
+    cal_base               = []
+    switches_disabled      = False
+    iir_scaling_required   = False
+    gain                   = [1] * 16
+    prev_ct                = 0
+    offset                 = 0
+
+    switch_config      = make_switch_config()
+    switch_config_base = make_switch_config()
+
+    # Pierwszy odczyt redundant, zeby miec baseline i CT
+    res = bms.run_generic_command_list(redundant_meas_list, board_list)
+    acells, fcells = [], []
+    for i, cell in enumerate(ADBMS6832.AVERAGED_CELLS):
+        acells.append(res['CELLS'][0][cell])
+        fcells.append(res['CELLS'][0][cell])
+    prev_ct = res['UNMUTE'][0]['CT']
+    redundant_timer = 0
+    rawcells = list(fcells)
+
+    while True:
+        # Odbierz ewentualne polecenia zmiany DCC z watku Flask
+        while not dcc_input.empty():
+            cfg = dcc_input.get()
+            switch_config[cfg['DCC']] = cfg['Val']
+
+        packet = {'FCELLS': [], 'RAWCELLS': [], 'ACELLS': [], 'CT': None}
+
+        # --- redundant measurement, co 100 przebiegow (jak w demo) ---
+        redundant_timer -= 1
+        if redundant_timer <= 0 and not cal_in_progress:
+            redundant_timer = 100
+            res = bms.run_generic_command_list(redundant_meas_list, board_list)
+            acells = [res['CELLS'][0][c] for c in ADBMS6832.AVERAGED_CELLS]
+
+            mute_ct = res['MUTE'][0]['CT']
+            unmute_ct = res['UNMUTE'][0]['CT']
+            if unmute_ct < mute_ct:
+                unmute_ct += 2048
+            offset = unmute_ct - mute_ct
+            if not iir_scaling_required:
+                iir_scaling_required = True
+                prev_ct = res['MUTE'][0]['CT']
+
+        # --- glowny pomiar filtered cells ---
+        res = bms.run_generic_command_list(meas_list, board_list)
+        current_ct = res['CT'][0]['CT']
+        scale, iir_scaling_required, offset = iir_scale(
+            prev_ct, current_ct, iir_scaling_required, offset)
+
+        rawcells = []
+        if not cal_in_progress:
+            fcells = []
+
+        for i, cell in enumerate(ADBMS6832.FILTERED_CELLS):
+            packet['ACELLS'].append(acells[i])
+
+            raw = res['CELLS'][0][cell]
+            rawcells.append(raw)
+
+            if not cal_in_progress:
+                packet['RAWCELLS'].append(raw)
+                fcells.append(raw)
+            else:
+                packet['RAWCELLS'].append(fcells[i])
+
+            if switches_disabled:
+                packet['FCELLS'].append(
+                    raw * (1 + (gain[i] - 1) * (1 - scale)))
+            else:
+                packet['FCELLS'].append(
+                    raw * (1 + (gain[i] - 1) * scale))
+
+        packet['CT'] = res['CT'][0]['CT']
+        packet['Total_PEC_Status'] = res.get('Total_PEC_Status')
+        packet['cal_state'] = cal_state
+
+        # --- maszyna stanow kalibracji ---
+        if time.time() - cal_time > CAL_PERIOD or cal_in_progress:
+
+            if not cal_state:
+                cal_state = 'start'
+
+            if cal_state == 'start':
+                print("Starting CAL")
+                board_list[0].update(switch_config_base)
+                dat = bms.run_generic_command_list(balance_list, board_list)
+                prev_ct = dat['CT'][0]['CT']
+                iir_scaling_required = True
+                cal_state = 'switch_off'
+                switches_disabled = True
+                cal_in_progress = True
+                print("CAL - Switch Off")
+
+            elif cal_state == 'switch_off':
+                if current_ct < prev_ct:
+                    ct = current_ct + 2048 - prev_ct
+                else:
+                    ct = current_ct - prev_ct
+
+                if ct >= IIR_TABLE[-1][0]:
+                    cal_state = 'switch_on'
+                    switches_disabled = False
+                    cal_base = list(rawcells)
+
+                    min_cell = min(cal_base)
+                    for i, cell in enumerate(ADBMS6832.FILTERED_CELLS):
+                        if (cal_base[i] > min_cell + BALANCE_ACCUR
+                                and cal_base[i] > MIN_BALANCE_VAL
+                                and switch_config.get(f'DCC{i+1}', False)):
+                            switch_config[f'DCC{i+1}'] = True
+
+                    board_list[0].update(switch_config)
+                    dat = bms.run_generic_command_list(balance_list, board_list)
+                    prev_ct = dat['CT'][0]['CT']
+                    iir_scaling_required = True
+                    print("CAL - Switch On")
+
+            elif cal_state == 'switch_on':
+                if current_ct < prev_ct:
+                    ct = current_ct + 2048 - prev_ct
+                else:
+                    ct = current_ct - prev_ct
+
+                if ct >= IIR_TABLE[-1][0]:
+                    cal_state = None
+                    cal_in_progress = False
+                    gain = []
+                    for i, cell in enumerate(ADBMS6832.FILTERED_CELLS):
+                        gain.append(cal_base[i] / rawcells[i]
+                                    if rawcells[i] else 1)
+                    cal_time = time.time()
+                    print("CAL - Done")
+
+        try:
+            queue.put(packet)
+        except Exception as e:
+            print("queue error:", e)
+
+        time.sleep(0.1)
+
+
+# --------------------------------------------------------------------------
+# Flask - minimalny podglad
+# --------------------------------------------------------------------------
+
+app = Flask(__name__)
+data_queue = Queue()
+dcc_queue = Queue()
+
+PAGE = """
+<!doctype html>
+<html>
+<head>
+    <title>ADBMS6832 przez Pico</title>
+    <meta http-equiv="refresh" content="1">
+    <style>
+        body { font-family: monospace; background:#111; color:#ddd; }
+        table { border-collapse: collapse; margin-top: 1em; }
+        td, th { border: 1px solid #444; padding: 4px 10px; text-align: right; }
+        th { background:#222; }
+        .stale { color:#888; }
+        .pec-true  { color:#4caf50; }
+        .pec-false { color:#f44336; }
+    </style>
+</head>
+<body>
+    <h2>ADBMS6832 - napiecia ogniw (przez mostek Pico)</h2>
+    <p>
+        CT: {{ ct }}
+        &nbsp;|&nbsp; PEC:
+        <span class="{{ 'pec-true' if pec else 'pec-false' }}">{{ pec }}</span>
+        &nbsp;|&nbsp; cal_state: {{ cal_state }}
+        &nbsp;|&nbsp; Ostatni update: {{ ts }}
+    </p>
+    <table>
+        <tr>
+            <th>Cell</th>
+            <th>Raw [V]</th>
+            <th>Filtered [V]</th>
+            <th>Averaged [V]</th>
+        </tr>
+        {% for i in range(n) %}
+        <tr class="{{ 'stale' if i >= connected else '' }}">
+            <td>{{ i+1 }}</td>
+            <td>{{ '%.4f' % rawcells[i] if i < rawcells|length else '-' }}</td>
+            <td>{{ '%.4f' % fcells[i] if i < fcells|length else '-' }}</td>
+            <td>{{ '%.4f' % acells[i] if i < acells|length else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% if connected < n %}
+    <p style="color:#888">
+        Wiersze wyszarzone dotycza kanalow bez fizycznie podlaczonego ogniwa
+        (NUM_CELLS_CONNECTED = {{ connected }}) - ich wartosci sa bez znaczenia.
+    </p>
+    {% endif %}
+</body>
+</html>
+"""
+
+_last_packet = {'FCELLS': [], 'ACELLS': [], 'RAWCELLS': [], 'CT': None,
+                 'Total_PEC_Status': None, 'cal_state': None}
+
+
+@app.route("/index")
+def index():
+    global _last_packet
+    while not data_queue.empty():
+        _last_packet = data_queue.get()
+
+    return render_template_string(
+        PAGE,
+        fcells=_last_packet.get('FCELLS', []),
+        acells=_last_packet.get('ACELLS', []),
+        rawcells=_last_packet.get('RAWCELLS', []),
+        ct=_last_packet.get('CT'),
+        pec=_last_packet.get('Total_PEC_Status'),
+        cal_state=_last_packet.get('cal_state'),
+        ts=time.strftime('%H:%M:%S'),
+        n=len(ADBMS6832.FILTERED_CELLS),
+        connected=NUM_CELLS_CONNECTED,
+    )
+
+
+@app.route("/data_update")
+def data_update():
+    global _last_packet
+    while not data_queue.empty():
+        _last_packet = data_queue.get()
+    return jsonify(_last_packet)
+
+
+if __name__ == '__main__':
+    background_process = Process(target=data_collection,
+                                  args=(data_queue, dcc_queue))
+    background_process.start()
+
+    webbrowser.open('http://127.0.0.1:5000/index')
+    serve(app, host='127.0.0.1', port=5000, threads=4)
