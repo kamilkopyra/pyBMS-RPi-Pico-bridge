@@ -1,3 +1,50 @@
+//  This script enables communication between a Raspberry Pi Pico 2 and an
+//  Analog Devices Battery Management System (BMS) using the pyBMS library.
+// 
+//  The Pico acts as a USB-to-SPI bridge between the host PC and the BMS device,
+//  allowing configuration, measurement acquisition, and status monitoring.
+// 
+//  Although the Pico cannot connect directly to the ADBMS GUI software,
+//  data visualization is still possible using the Customer_GUI.py script
+//  provided by Analog Devices as part of the pyBMS framework.
+// 
+//  This script was written to replace the SDP-K1 evaluation board 
+//  in the original Analog Devices measurement chain.
+//  The original goal was to emulate the Linduino platform. 
+//  However, due to the limited amount of Linduino-related
+//  documentation and implementation details available within the pyBMS
+//  library, SDP-K1 compatibility was chosen as the primary reference.
+//
+// 
+//  Communication path:
+//  PC ---------> Raspberry Pi Pico 2 --------> ADBMS6822 -----------> ADBMS6832
+//        USB                           SPI                 isoSPI
+// 
+//  Although the communication pipeline has been tested using
+//  the ADBMS6822 and ADBMS6832, it should also be compatible with
+//  other Analog Devices battery-monitoring devices supported by
+//  the pyBMS library.
+//
+//  The communication pipeline supports multiple daisy-chained measurement devices.
+//  Devices are defined on the PC side, and command sequences are generated
+//  automatically by the pyBMS framework.
+// 
+//  Potential improvements:
+//  - It may be possible to connect directly to the ADBMS GUI software by
+//    emulating the SDP-K1 evaluation board by modifying the reported USB
+//    device name and/or USB descriptors.
+// 
+//  - Add a standalone monitoring mode running directly on the Pico,
+//     eliminating the need for a host PC during normal operation
+//  
+//  - Design a dedicated PCB integrating the Raspberry Pi Pico 2 and the
+//    ADBMS6822 transceiver into a single compact module.
+
+//  Examples for PC side scripts can be found in pc_tests folder 
+
+
+
+
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include <stdint.h>
@@ -5,33 +52,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+
+
 #define MAX_FRAME_SIZE 256
 #define MAX_COMMANDS 128
 #define MAX_COMMAND_SIZE 256
-#define RESULT_MAX 4096
+
 
 uint8_t command_buffer[MAX_COMMANDS][MAX_COMMAND_SIZE];
 uint16_t command_sizes[MAX_COMMANDS];
 uint16_t command_orig_sizes[MAX_COMMANDS];
 
-static uint8_t rx_tmp [MAX_COMMAND_SIZE];
 static uint8_t tx_dummy [MAX_COMMAND_SIZE];
-
-static uint8_t out_buf[8192];
-static uint32_t out_len = 0;
-
-static void out_byte(uint8_t b)
-{
-    if (out_len < sizeof(out_buf)) out_buf[out_len++] = b;
-
-}
-
-static void out_flush(void)
-{
-    fwrite(out_buf, 1, out_len, stdout);
-    fflush(stdout);
-    out_len = 0;
-}
 
 
 uint16_t command_count = 0;
@@ -47,10 +79,6 @@ int raw_calls = 0;
 #define GPIO_PIN 6          
  
 #define SPI_SPEED (0.5* 1000* 1000)
-
-#define READ_TIMEOUT 20
-#define MISO_TIMEOUT 1000
- 
  
 #define SPI_CPOL SPI_CPOL_0
 #define SPI_CPHA SPI_CPHA_0
@@ -134,8 +162,14 @@ static void spi_write_slow(const uint8_t *data, uint16_t len, uint32_t gap_us)
     }
 }
 
-static void spi_read_slow(uint8_t *rx, uint16_t len, uint32_t gap_us)
-{
+static void spi_read_slow(uint8_t *rx, uint16_t len, uint32_t gap_us){  
+// This function inserts delays between SPI bytes, matching the behavior
+// observed on the Linduino implementation.
+//
+// The ADBMS6832 datasheet does not explicitly require these delays;
+// however, during validation no valid data was received on MISO without
+// introducing inter-byte gaps during read transactions. 
+
     uint8_t dummy = 0x00;
     for (uint16_t i = 0; i < len; i++) 
     {
@@ -211,7 +245,8 @@ void get_cmd(void)
 
     for (uint16_t i = 0; i < command_count; i++)
     {
-        total += 2 + command_sizes[i];
+        uint16_t payload_len = command_sizes[i] - 10;
+        total += 2 + payload_len;
     }
     putchar_raw((total >> 24) & 0xFF);
     putchar_raw((total >> 16) & 0xFF);
@@ -223,10 +258,12 @@ void get_cmd(void)
 
     for(uint16_t i = 0; i < command_count; i++)
     {
-        putchar_raw(command_sizes[i] >> 8);
-        putchar_raw(command_sizes[i] & 0xFF);
+        uint16_t payload_len = command_sizes[i] - 10;
 
-        for(uint16_t j = 0; j < command_sizes[i]; j++)
+        putchar_raw(payload_len >> 8);
+        putchar_raw(payload_len & 0xFF);
+
+        for(uint16_t j = 10; j < command_sizes[i]; j++)
         {
             putchar_raw(
                 command_buffer[i][j]
@@ -330,7 +367,7 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
     uint16_t rx_len = ((uint16_t)cmd_buf[6] << 8) | cmd_buf[7];
     uint8_t *tx_data = &cmd_buf[10];
 
-    // reference for commands in RaspberryPi_SPI.py
+    // Command mapping reference: RaspberryPi_SPI.py
     switch(cmd)
     {
 
@@ -360,12 +397,11 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
                 memset(tx_dummy, 0x00, rx_len);
                 spi_read_slow(&cmd_buf[len], rx_len, 50);
                 cs_high();
-                memcpy(&cmd_buf[len], rx_tmp, rx_len);
                 return rx_len;
             }
 
             cs_high();
-            return rx_len;
+            return 0;
         
         case 0x03:   //poll
             return 0;
@@ -411,38 +447,6 @@ uint16_t execute_command(uint8_t *cmd_buf, uint16_t len)
     }
 
 
-    
-void send_RDSTATC()
-{
-    uint8_t cmd[] =
-    {
-        0x00,
-        0x2D,
-        0xD2,
-        0xA2
-    };
-
-    uint8_t rx[8];
-    uint8_t dummy[8] = {0};
-
-    cs_low();
-
-    spi_write_blocking(
-        spi0,
-        cmd,
-        4
-    );
-
-    spi_write_read_blocking(
-        spi0,
-        dummy,
-        rx,
-        8
-    );
-
-    cs_high();
-}
-
 
 
 
@@ -450,7 +454,8 @@ void send_RDSTATC()
 void setup() 
 {
     stdio_init_all();
-    busy_wait_ms(1000);
+    busy_wait_ms(1000);    // busy_wait_ms() is used instead of sleep_ms() because sleep_ms()
+                                // occasionally caused USB communication stalls during command reception.
 
     gpio_init(CS_PIN);
     gpio_set_dir(CS_PIN, GPIO_OUT);
@@ -462,12 +467,6 @@ void setup()
  
     spi_init(spi0, SPI_SPEED);      
     spi_set_format(spi0, 8, SPI_CPOL, SPI_CPHA, SPI_MSB_FIRST);
-
-    for (int i = 0 ; i < 5 ; i++)
-    {
-        busy_wait_ms(1000);
-        send_RDSTATC();
-    }
 
 
 }
