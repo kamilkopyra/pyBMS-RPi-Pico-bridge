@@ -64,6 +64,75 @@ Buffer limits: 128 commands per list, 256 bytes per command.
 | `reference/demo_adi_original.py` | Original ADI Discharge_Algo_Demo (ADBMS6830, SDP-K1), kept as reference |
 | `reference/logs/` | Captured communication logs (Linduino vs Pico) |
 
+## Scripts
+
+### `pyBMS_PC_TEST.py` — communication test
+
+A console script for checking that the whole chain (PC → Pico → ADBMS6822 →
+ADBMS6832) works. It runs the command lists below twice and logs every
+result:
+
+- **init:** sets the SPI clock, wakes up the chain, writes and reads back
+  config registers A/B and starts continuous cell conversion (`ADCV`).
+- **meas:** reads filtered cell voltages (`RDFCA`…`RDFCF`) and the conversion
+  counter (`CT`).
+- **balance:** writes config B (discharge switches) and reads `CT`.
+- **redundant_meas:** a MUTE/UNMUTE sequence plus averaged cell voltages
+  (`RDACA`…`RDACF`).
+- **test_list2:** a single-shot `ADCV` and a read of cell group A (`RDCVA`).
+
+Use `-d linduino` to run the same test through a Linduino instead of the Pico.
+You can then compare the two logs frame by frame.
+
+### `demo_pico.py` — web monitoring demo
+
+A port of the ADI Discharge_Algo_Demo (`reference/demo_adi_original.py`) to the
+Pico and ADBMS6832. Measurement runs in a separate process. A Flask/waitress
+server shows the results at `http://127.0.0.1:5000/index`, and the page
+refreshes every second. It shows:
+
+- **Cell measurements:** raw, filtered (IIR) and averaged voltage for each cell.
+- **GPIO measurements:** G1–G10, GA11, GA12, VM and VP. Read every 10 loops.
+- **Device diagnostics:** VREF2, internal temperature, VD, VA and VRES. Read
+  every 10 loops.
+- **Status line:** conversion counter (`CT`), PEC status and calibration state.
+
+A redundant measurement (averaged cells) runs every 100 loops.
+
+The calibration/balancing state machine from the ADI demo (switch off →
+switch on → compute gain) is ported, but **disabled** for now
+(`if False and ...`). Its parameters were copied from the ADBMS6830 demo and
+have not been verified for the ADBMS6832. The page is read-only. It has no
+buttons for controlling balancing.
+
+### `BMS_logger.py` — loggers
+
+Both loggers write JSON Lines, one JSON object per line. The files are
+overwritten on every run.
+
+- **`BMSLogger`** (`bms_log.jsonl`):
+  - `log(result)` saves a timestamp, the PEC status and the `CFG`, `CELLS`,
+    `CT`, `MUTE` and `UNMUTE` entries from a pyBMS result dict. It returns the
+    result unchanged, so you can wrap a call:
+    `logger.log(bms.run_generic_command_list(...))`.
+  - `write(message)` adds a text marker, e.g. `"init"`.
+- **`RawFrameLogger`** (`raw_frames.jsonl`) hooks into the `USB_TO_SPI_BYTE`
+  interface and logs every frame on the wire: **TX** (command type + bytes sent
+  to the Pico) and **RX** (data coming back). This is useful for debugging the
+  firmware and comparing Pico vs Linduino.
+
+```python
+from BMS_logger import BMSLogger, RawFrameLogger
+
+interface = USB_TO_SPI_BYTE(port, 115200)
+raw_logger = RawFrameLogger(interface)
+logger = BMSLogger()
+bms = BMS(interface)
+
+logger.write("measurement")
+logger.log(bms.run_generic_command_list(commands, board_list))
+```
+
 ## Setup
 
 1. Build `pico_usb.c` with the [Pico SDK](https://github.com/raspberrypi/pico-sdk)
