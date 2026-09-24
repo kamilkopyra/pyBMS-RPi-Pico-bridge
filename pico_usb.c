@@ -40,7 +40,7 @@
 //  - Design a dedicated PCB integrating the Raspberry Pi Pico 2 and the
 //    ADBMS6822 transceiver into a single compact module.
 
-//  Examples for PC side scripts can be found in pc_tests folder 
+//  Examples for PC side scripts: pyBMS_PC_TEST.py and demo_pico.py
 
 
 
